@@ -94,3 +94,7 @@ deploy:
         MOD_ID: ${{MOD_ID}}
         ADELE_ID: ${{ADELE_ID}}
         LIDIA_ID: ${{LIDIA_ID}}
+        TEAM_ID: ${{TEAM_ID}}
+        DRIVE_ID: ${{DRIVE_ID}}
+        GENERAL_CHANNEL_ID: ${{GENERAL_CHANNEL_ID}}
+        CREATE_TEAM: ${{CREATE_TEAM}}

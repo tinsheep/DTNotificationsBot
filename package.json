@@ -21,6 +21,7 @@
     "dependencies": {
         "@microsoft/adaptivecards-tools": "^1.0.0",
         "@microsoft/microsoft-graph-client": "^3.0.5",
+        "@microsoft/microsoft-graph-types": "^2.38.0",
         "@microsoft/teamsfx": "^2.2.2",
         "botbuilder": "^4.20.0"
     },
