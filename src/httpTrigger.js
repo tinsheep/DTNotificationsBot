@@ -28,24 +28,36 @@ module.exports = async function (context, req) {
     const appCredential = new AppCredential(appAuthConfig)
     const graphClient = createMicrosoftGraphClientWithCredential(appCredential);
 
+    //create a new team based on the incomming request
+
     let teamId;
     let driveId;
     let generalChannelId;
+    const requestBody = req.body;
+
+    //select the email from the request body of the first owner role in the members array
+    const ownerMember = requestBody.members.find(member => member.role && member.role.includes('owner'));
+    if (!ownerMember) {
+      throw new Error('No owner role defined in the request');
+    }
+    const ownerEmail = ownerMember.email;
+
+
     //debug switch to create a new team or use an existing team to save time debugging
     if (process.env.CREATE_TEAM === 'true') {
 
       //create Incident response team from a teamsTemplate
       const teamTemplate = {
-        'template@odata.bind': 'https://graph.microsoft.com/v1.0/teamsTemplates(\'' + process.env.TEAMS_TEMPLATE_ID  +  '\')',
-        displayName: process.env.INCIDENT_NAME,
-        description: process.env.INCIDENT_DESCRIPTION,
+        'template@odata.bind': 'https://graph.microsoft.com/v1.0/teamsTemplates(\'' + requestBody.templateId  +  '\')',
+        displayName: requestBody.incidentName,
+        description: requestBody.incidentDescription,
         members:[
             {
                '@odata.type': '#microsoft.graph.aadUserConversationMember',
                roles:[
                   'owner'
                ],
-               'user@odata.bind': 'https://graph.microsoft.com/v1.0/users/' + process.env.MOD_ID
+              'user@odata.bind': 'https://graph.microsoft.com/v1.0/users(\'' + ownerEmail + '\')'
             }
         ]
       }
@@ -90,19 +102,25 @@ module.exports = async function (context, req) {
     const filePath = 'C:\\Users\\tinsh\\Documents\\Incident.pdf';
 
     //upload the incident report to the general channel
-    const incidentReportUrl = await  uploadToTeamsGeneralChannel(driveId, filePath, graphClient);
+    //I need to also pass in the teamId and the generalChannelId to properly construct the deep link to the file
+    const incidentReportUrl = await  uploadToTeamsGeneralChannel(driveId, filePath, graphClient, teamId, generalChannelId);
  
     console.log(`File uploaded to General channel: ${incidentReportUrl}`);
 
+    //send a notification to the installed app
     for (const target of installations) {
       await target.sendAdaptiveCard(
         AdaptiveCards.declare(notificationTemplate).render({
-          title: "New incident workspace created.",
+          title: "New Incident Workspace Created",
           appName: "Disaster Tech",
-          description: `Welcome to the new incident team. Here is the Incident Action Plan:  ${target.type}`,
+          description: `A new incident workspace was created. Click the button below to view the incident report:`,
           notificationUrl: incidentReportUrl,
         })
       );
+
+
+      //now that the incident report is uploaded to the general channel, we can add additional members to the team
+      await addMembersToTeam(teamId, requestBody.members, graphClient);
 
 
       /****** To distinguish different target types ******/
@@ -176,6 +194,105 @@ module.exports = async function (context, req) {
 
   // Supporting functions
 
+  function generateGUID() {
+    let guid = "";
+    for (let i = 0; i < 32; i++) {
+      guid += Math.floor(Math.random() * 16).toString(16);
+    }
+    return guid;
+  }
+
+  async function addMembersToTeam(teamId, members, graphClient) {
+    for (const member of members) {
+      let user;
+      try {
+        user = await graphClient.api(`/users/${member.email}`).get();
+      } catch (error) {
+        console.log(`Error getting user with email ${member.email}: ${error.message}`);
+        // Retry up to 3 times with a delay of 2 seconds between retries
+        // This is to handle the case where the user is not found immediately after creation
+        // This can happen if the user is created in Azure AD but not yet replicated to Microsoft Graph
+        // it might also be the case that the user is not found because it is a guest user
+        // that does not exist in the tenant.
+        for (let i = 0; i < 3; i++) {
+          console.log(`Retrying... Attempt ${i + 1}`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          try {
+            user = await graphClient.api(`/users/${member.email}`).get();
+            break;
+          } catch (error) {
+            console.log(`Error getting user with email ${member.email}: ${error.message}`);
+          }
+        }
+      }
+
+      // Check if the user is already a member of the team
+      const teamMembers = await graphClient.api(`/teams/${teamId}/members`).get();
+      const existingMember = teamMembers.value.find((m) => m.email && m.email.toLowerCase() === user?.userPrincipalName?.toLowerCase());
+      if (existingMember) {
+        console.log(`User ${user.userPrincipalName} is already a member of the team.`);
+        continue;
+      }
+
+      // Determine the role of the member
+      let role;
+      if (member.role && member.role.includes('owner')) {
+        role = 'owner';
+      } else if (member.role && member.role.includes('member')) {
+        role = []; // Set role to an empty array as this means the user is a member.
+      } else if (member.role && member.role.includes('guest')) {
+        let guestUser;
+        try {
+          guestUser = await graphClient.api(`/users?$filter=startswith(mail, '${encodeURIComponent(member.email)}')&$select=userType,id,userPrincipalName`).get();
+          guestUser.id = guestUser.value[0].id;
+          console.log(`User ${member.email} is already a guest in the tenant.`);
+        } catch (error) {
+          if (error.statusCode === 404) {
+            console.log(`User ${member.email} is not found in the tenant. Inviting...`);
+            // Send an invite to the guest to join the tenant
+            const invite = {
+              invitedUserEmailAddress: member.email,
+              inviteRedirectUrl: 'https://teams.microsoft.com',
+              sendInvitationMessage: true,
+              roles: ['guest']
+            };
+            const invitation = await graphClient.api(`/invitations`).post(invite);
+            console.log(`Sent invitation to ${member.email} to join the tenant as a guest.`);
+
+            // Update the user object with the invitation ID
+            guestUser.id = invitation.invitedUser.id;
+          } else {
+            console.log(`Error checking if user ${member.email} is a guest in the tenant: ${error.message}`);
+          }
+        }
+
+        // Add the guest to the team
+        // Note: This call is not supported with application permissions and will result in a 403 Forbidden error.
+        // You must use delegated permissions to add a guest to a team.
+        // uncomment when you have the correct permissions.
+        // const guestToAdd = {
+        //   '@odata.type': '#microsoft.graph.aadUserConversationMember',
+        //   'roles': ['guest'],
+        //   'user@odata.bind': `https://graph.microsoft.com/v1.0/users/${guestUser.id}`
+        // };
+        // await graphClient.api(`/teams/${teamId}/members`).post(guestToAdd);
+        // console.log(`Added guest ${member.email} to the team as a guest.`);
+        continue;
+      } else {
+        console.log(`Unknown role for user ${member.email}. Skipping.`);
+        continue;
+      }
+
+      // Add the member to the team
+      const memberToAdd = {
+        '@odata.type': '#microsoft.graph.aadUserConversationMember',
+        roles: role,
+        'user@odata.bind': `https://graph.microsoft.com/v1.0/users/${user.id}`
+      };
+      await graphClient.api(`/teams/${teamId}/members`).post(memberToAdd);
+      console.log(`Added user ${user.userPrincipalName} to the team as a ${role.length ? role : 'member'}.`);
+    }
+  }
 
   async function getGeneralChannelDriveIdWithRetry(teamId, graphClient, maxRetries = 5, retryDelay = 2000) {
     let retries = 0;
